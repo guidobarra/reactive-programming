@@ -1,0 +1,11 @@
+
+services:
+  service-external:
+    image: service-external
+    container_name: service-external
+    hostname: service-external
+    build:
+      context: .
+      dockerfile: DockerfileExternal
+    ports:
+      - "9292:8080"
