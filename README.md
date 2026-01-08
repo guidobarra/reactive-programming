@@ -286,3 +286,207 @@ Esta implementación custom es fundamental para entender:
 
 Antes de usar librerías como Project Reactor, es esencial entender estos conceptos fundamentales que esta sección demuestra con código propio.
 
+## Cold Publisher vs Hot Publisher
+
+En programación reactiva, existen dos tipos fundamentales de Publishers: **Cold Publisher** (Editor Frío) y **Hot Publisher** (Editor Caliente). Entender la diferencia entre ambos es crucial para diseñar sistemas reactivos eficientes y apropiados.
+
+### Cold Publisher (Editor Frío)
+
+Un **Cold Publisher** es el comportamiento por defecto de los Publishers en Reactor. Para cada suscriptor, se crea un **productor de datos dedicado y separado**.
+
+#### Características Principales
+
+- **Flujo independiente por suscriptor**: Cada vez que un `Subscriber` se suscribe, se crea un **nuevo flujo de datos** desde el principio
+- **Datos no compartidos**: Los datos **NO se comparten** entre suscriptores por defecto
+- **Evaluación perezosa por suscripción**: El método de creación (Flux.create, Flux.generate, etc.) se invoca para **cada suscriptor**
+- **Comportamiento "Netflix-like"**: Cada persona ve su propia película desde el principio
+
+#### Analogía: Netflix
+
+Imagina Netflix: cuando dos usuarios diferentes ven la misma película, cada uno tiene su propio stream independiente. Si un usuario se une tarde, ve desde el principio. Cada usuario tiene su propia experiencia completa.
+
+#### Ejemplo Real: Aplicación de Reparto de Comida
+
+En una aplicación de reparto de comida por Internet:
+- Usuario 1 pide pizza → Recibe mensajes específicos: "Su pedido está siendo preparado", "Su conductor está a 5 millas"
+- Usuario 2 pide pizza → Recibe mensajes diferentes: "Su pedido está siendo preparado", "Su conductor está a 4 millas"
+
+Estos son **dos flujos de mensajes diferentes** e independientes, específicos para cada usuario y su solicitud.
+
+#### Ventajas de Cold Publisher
+
+1. **Aislamiento completo**: Cada suscriptor tiene su propio flujo independiente
+2. **Datos completos**: Cada suscriptor recibe todos los datos desde el principio
+3. **Seguridad**: No hay estado compartido entre suscriptores
+4. **Flexibilidad**: Cada suscriptor puede procesar los datos de manera diferente
+
+#### Casos de Uso para Cold Publisher
+
+- **Aplicaciones específicas por usuario**: Mensajes de seguimiento de pedidos, notificaciones personales
+- **Lectura de archivos**: Cada suscriptor lee el archivo completo desde el inicio
+- **Consultas a base de datos**: Cada suscriptor ejecuta su propia consulta
+- **APIs REST**: Cada llamada obtiene su propia respuesta completa
+- **Procesamiento de colecciones**: Cuando cada suscriptor necesita procesar todos los datos
+
+**Regla general**: Usa Cold Publisher cuando los datos son **específicos para cada usuario o solicitud**.
+
+### Hot Publisher (Editor Caliente)
+
+Un **Hot Publisher** comparte el **mismo flujo de datos** entre todos los suscriptores. Los datos se generan **una sola vez** y se distribuyen a todos los suscriptores activos.
+
+#### Características Principales
+
+- **Un solo productor para todos**: El método de creación se invoca **solo una vez**, no por cada suscriptor
+- **Datos compartidos**: Todos los suscriptores comparten el **mismo flujo de datos**
+- **Puede comenzar sin suscriptores**: Puede empezar a emitir datos incluso sin ningún suscriptor (dependiendo del método usado)
+- **Comportamiento "Cine/Sala de Teatro"**: Todos ven la misma película al mismo tiempo
+
+#### Analogía: Cine/Sala de Teatro
+
+Imagina un cine: todos los espectadores ven la misma película al mismo tiempo. Si alguien llega tarde, se pierde las escenas que ya pasaron. La película sigue reproduciéndose independientemente de quién esté viendo.
+
+#### Ejemplo Real: Aplicación Web con Noticias
+
+En una aplicación web (Spring Boot) con frontend (Angular, React, móvil):
+- **Noticias**: Los resultados electorales de EE.UU. - "Estos son los resultados hasta ahora"
+- **Información meteorológica**: Condiciones del clima actuales
+- **Cotizaciones bursátiles**: Precios de acciones en tiempo real
+
+Esta información **NO es específica del usuario**. Es información dura que será **igual para todos los usuarios**. Todos necesitan ver los mismos datos al mismo tiempo.
+
+#### Ventajas de Hot Publisher
+
+1. **Eficiencia de recursos**: Los datos se generan una sola vez, no por cada suscriptor
+2. **Tiempo real**: Todos los suscriptores reciben datos en tiempo real
+3. **Escalabilidad**: Puedes agregar muchos suscriptores sin duplicar la generación de datos
+4. **Broadcasting**: Ideal para distribuir información a múltiples consumidores
+
+#### Casos de Uso para Hot Publisher
+
+- **Noticias y actualizaciones**: Resultados electorales, noticias generales
+- **Información meteorológica**: Condiciones del clima para todos los usuarios
+- **Cotizaciones bursátiles**: Precios de acciones en tiempo real
+- **Notificaciones push**: Eventos que deben ser recibidos por múltiples clientes
+- **Dashboards y monitoreo**: Métricas del sistema que múltiples usuarios deben ver
+- **Eventos del sistema**: Logs, métricas, eventos que ocurren una vez
+
+**Regla general**: Usa Hot Publisher cuando necesitas **difundir la misma información a múltiples usuarios**.
+
+### Métodos para Crear Hot Publishers
+
+#### 1. share() - Compartir con Mínimo de Suscriptores
+
+```java
+Flux<String> hotFlux = coldFlux.share();
+// share() es un ALIAS para: publish().refCount(1)
+```
+
+**⚠️ IMPORTANTE**: `share()` es un **alias de `publish().refCount(1)`**, NO de `publish().autoConnect(0)`. Esta distinción es crucial para entender el comportamiento correcto.
+
+**Características**:
+- `share()` mantiene una referencia activa mientras haya **al menos un suscriptor**
+- Necesita **mínimo 1 suscriptor** para comenzar a emitir datos
+- Se **detiene automáticamente** cuando no hay suscriptores (0 suscriptores)
+- Si alguien se suscribe después de detenerse, **vuelve a comenzar desde el principio**
+- Permite que todos los suscriptores compartan la misma fuente de datos, evitando la multiplicación de emisiones
+- Útil cuando no quieres hacer trabajo innecesario cuando no hay suscriptores
+
+**Para requerir mínimo N suscriptores**:
+```java
+Flux<String> hotFlux = coldFlux.publish().refCount(2); // Mínimo 2 suscriptores
+Flux<String> hotFlux = coldFlux.publish().refCount(10); // Mínimo 10 suscriptores
+```
+
+#### 2. publish().autoConnect(0) - Publisher Realmente Caliente
+
+```java
+Flux<String> hotFlux = coldFlux.publish().autoConnect(0);
+```
+
+**Características**:
+- Comienza a emitir datos **inmediatamente**, incluso con 0 suscriptores
+- **NO se detiene** cuando los suscriptores cancelan
+- Una vez que comienza, continúa produciendo **independientemente de los suscriptores**
+- Es un "Hot Publisher realmente caliente" - siempre está activo
+
+**Cuándo usar**: Cuando quieres un verdadero editor caliente que no te importa si hay suscriptores o no, quieres seguir emitiendo datos haya gente o no.
+
+#### 3. replay().autoConnect(0) - Hot Publisher con Caché
+
+```java
+Flux<Integer> hotFlux = coldFlux.replay(1).autoConnect(0); // Cachea el último valor
+Flux<Integer> hotFlux = coldFlux.replay(5).autoConnect(0); // Cachea los últimos 5 valores
+```
+
+**Características**:
+- Cachea los últimos N valores emitidos
+- Los suscriptores tardíos reciben primero los valores cacheados
+- Luego continúan recibiendo valores nuevos en tiempo real
+- Útil cuando los suscriptores tardíos necesitan ver el estado actual
+
+**Ejemplo**: Precios de acciones - los nuevos clientes ven el precio actual inmediatamente, luego reciben actualizaciones en tiempo real.
+
+### Comparación Visual
+
+#### Cold Publisher (Netflix)
+```
+Usuario 1 → [Película completa desde el inicio]
+Usuario 2 → [Película completa desde el inicio]
+```
+- Cada usuario tiene su propio stream independiente
+- Si te unes tarde, ves desde el principio
+
+#### Hot Publisher (Cine)
+```
+[Película en curso] → Usuario 1
+                    → Usuario 2
+                    → Usuario 3
+```
+- Todos ven la misma película al mismo tiempo
+- Si te unes tarde, te pierdes lo que ya pasó
+
+### Resumen de Diferencias
+
+| Aspecto | Cold Publisher | Hot Publisher |
+|---------|---------------|---------------|
+| **Flujo de datos** | Independiente por suscriptor | Compartido entre suscriptores |
+| **Invocación del método** | Una vez por cada suscriptor | Una vez para todos |
+| **Datos** | Específicos por usuario/solicitud | Iguales para todos |
+| **Analogía** | Netflix (cada uno su película) | Cine (todos la misma película) |
+| **Si te unes tarde** | Ves desde el principio | Te pierdes lo que ya pasó |
+| **Uso principal** | Datos específicos del usuario | Información general/broadcasting |
+| **Eficiencia** | Menos eficiente (regenera datos) | Más eficiente (genera una vez) |
+
+### Cuándo Usar Cada Uno
+
+**Usa Cold Publisher cuando**:
+- Los datos son específicos para cada usuario o solicitud
+- Cada suscriptor necesita todos los datos desde el principio
+- Quieres aislamiento completo entre suscriptores
+- Los datos pueden regenerarse sin problema
+
+**Usa Hot Publisher cuando**:
+- Necesitas difundir la misma información a múltiples usuarios
+- Los datos son costosos de generar y quieres compartirlos
+- Necesitas comportamiento de broadcasting o pub/sub
+- Múltiples suscriptores necesitan ver el mismo estado actual
+- Quieres eficiencia de recursos
+
+### Crear un Hot Publisher
+
+Crear un Hot Publisher no es muy difícil. Tienes varias opciones:
+
+1. **share()**: Para la mayoría de casos, necesita al menos 1 suscriptor, se detiene cuando no hay suscriptores
+2. **publish().refCount(N)**: Para requerir mínimo N suscriptores antes de comenzar
+3. **publish().autoConnect(0)**: Para un Hot Publisher realmente caliente que nunca se detiene
+4. **replay(N).autoConnect(0)**: Para cachear valores y dárselos a suscriptores tardíos
+
+La elección depende de tus requisitos específicos: ¿necesitas que se detenga cuando no hay suscriptores? ¿Necesitas que los suscriptores tardíos vean datos históricos? ¿Necesitas un mínimo de suscriptores?
+
+### Conclusión
+
+- **Cold Publisher**: Datos específicos por usuario → Como Netflix, cada uno su propia experiencia
+- **Hot Publisher**: Misma información para todos → Como un cine, todos ven lo mismo al mismo tiempo
+
+La mayoría de las veces usarás **Cold Publisher** (comportamiento por defecto), pero cuando necesites difundir información a múltiples usuarios, **Hot Publisher** es la solución eficiente y apropiada.
+
