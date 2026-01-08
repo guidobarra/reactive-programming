@@ -24,6 +24,7 @@ public class App
                 .subscribe(Util.subscriber());
     }
 
+    //print System.out.println("created") only one
     static void whatCanWeExpect2() {
         Flux<Object> flux = Flux.create(fluxSink -> {
                     System.out.println("created");
