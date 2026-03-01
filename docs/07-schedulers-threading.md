@@ -127,7 +127,7 @@ POSICIÓN EN EL PIPELINE:
 | `doOnNext` | `oundedElastic-1` | Operador downstream, los datos fluyen desde `Flux.create` en `oundedElastic` |
 | `Subscriber` | `oundedElastic-1` | Mismo hilo que la fuente |
 
-> **Regla corregida:** `subscribeOn()` mueve la **fuente y todos los operadores entre la fuente y el `subscribeOn()`** a un nuevo hilo. Los operadores colocados **después** del `subscribeOn()` (más cerca del subscriber) se ejecutan en el hilo llamante durante la fase de suscripción.
+> **Regla:** `subscribeOn()` mueve la **fuente y todos los operadores entre la fuente y el `subscribeOn()`** a un nuevo hilo. Los operadores colocados **después** del `subscribeOn()` (más cerca del subscriber) se ejecutan en el hilo llamante durante la fase de suscripción.
 
 **Cuándo usar:** cuando la fuente es bloqueante (llamadas a BD, APIs, lectura de archivos) y necesitas no bloquear el hilo que llama a `subscribe()`.
 
