@@ -89,11 +89,12 @@ public class Lec03MultipleSubscribeOn {
                            }
                            sink.complete();
                        })
+                       .doFirst(() -> log.info("first1"))
                        .subscribeOn(Schedulers.newParallel("gubathread"))
                        .doOnNext(v -> log.info("value: {}", v))
-                       .doFirst(() -> log.info("first1"))
+                       .doFirst(() -> log.info("first2"))
                        .subscribeOn(Schedulers.boundedElastic())
-                       .doFirst(() -> log.info("first2"));
+                       .doFirst(() -> log.info("first3"));
 
 
         Runnable runnable1 = () -> flux.subscribe(Util.subscriber("sub1"));

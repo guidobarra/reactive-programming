@@ -145,12 +145,13 @@ public class Lec05PublishOn {
                        .doOnNext(v -> log.info("value: {}", v))
                        .doFirst(() -> log.info("first1"))
                        .publishOn(Schedulers.boundedElastic())
+                       .map(s-> {log.info("map"); return s;})
                        .doFirst(() -> log.info("first2"));
 
 
         Runnable runnable1 = () -> flux.subscribe(Util.subscriber("sub1"));
 
-        Thread.ofPlatform().start(runnable1);
+        Thread.ofPlatform().name("th-platform").start(runnable1);
 
         Util.sleepSeconds(2);
 

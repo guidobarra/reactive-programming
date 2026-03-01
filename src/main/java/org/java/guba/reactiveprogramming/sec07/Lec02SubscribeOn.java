@@ -118,10 +118,8 @@ public class Lec02SubscribeOn {
 
 
         Runnable runnable1 = () -> flux.subscribe(Util.subscriber("sub1"));
-        Runnable runnable2 = () -> flux.subscribe(Util.subscriber("sub2"));
 
         Thread.ofPlatform().name("th-virtual-A").start(runnable1);
-        Thread.ofPlatform().name("th-virtual-B").start(runnable2);
 
         Util.sleepSeconds(2);
 
