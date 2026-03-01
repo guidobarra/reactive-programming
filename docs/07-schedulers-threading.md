@@ -131,7 +131,7 @@ POSICIÓN EN EL PIPELINE:
 
 **Cuándo usar:** cuando la fuente es bloqueante (llamadas a BD, APIs, lectura de archivos) y necesitas no bloquear el hilo que llama a `subscribe()`.
 
-**Regla de múltiples `subscribeOn()`:** si hay más de uno, solo el **más cercano a la fuente** tiene efecto. Los demás son ignorados.
+**Regla de múltiples `subscribeOn()`:** para la **emisión de datos**, solo el **más cercano a la fuente** determina el hilo. Sin embargo, durante la **fase de suscripción** cada `subscribeOn()` actúa como relay cambiando el hilo para los `doFirst()` que estén entre ellos (ver Lec03 para el análisis detallado).
 
 ---
 
@@ -627,10 +627,10 @@ Subscriber                 → parallel-1
 
 ---
 
-#### Los logs esperados
+#### Los logs
 
 ```
-[    th-platform] first2          → doFirst downstream de subscribeOn → hilo llamante
+[        Thread-0] first2          → doFirst downstream de subscribeOn → hilo llamante
 [oundedElastic-1] first1          → doFirst upstream de subscribeOn → boundedElastic ✅
 [oundedElastic-1] generating: 1   → Flux.create en boundedElastic (subscribeOn lo movió aquí) ✅
 [oundedElastic-1] generating: 2   → publishOn tiene cola interna → producer adelanta al consumer
@@ -778,9 +778,9 @@ Durante la **fase de suscripción** (← upstream), `subscribeOn` cambia el hilo
 
 | Operador / Método | ¿Afectado? | Nota |
 |-------------------|------------|------|
-| `doFirst()` upstream de `subscribeOn` | ✅ | Corre en el nuevo scheduler |
-| `doFirst()` downstream de `subscribeOn` | ❌ | Corre en el hilo llamante |
-| `doOnSubscribe()` | ✅ | Se ejecuta al establecer la suscripción, en el nuevo scheduler |
+| `doFirst()` upstream de `subscribeOn` | ✅ | Corre en el nuevo scheduler — la señal de suscripción ya cambió de hilo |
+| `doFirst()` downstream de `subscribeOn` | ❌ | Corre en el hilo llamante — se ejecuta antes de que `subscribeOn` cambie el hilo |
+| `doOnSubscribe()` (cualquier posición) | ✅ | **Siempre** corre en el nuevo scheduler, independientemente de su posición. A diferencia de `doFirst`, reacciona a la señal `onSubscribe` que viaja → downstream desde la fuente (ya en el scheduler). |
 
 Durante la **fase de emisión de datos** (→ downstream), como la fuente ya corre en el nuevo scheduler, todos los operadores heredan ese hilo a menos que un `publishOn` lo cambie:
 
