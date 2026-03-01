@@ -130,12 +130,12 @@ public class Lec04VirtualThreads {
                        .doOnNext(v -> log.info("value: {}", v))
                        .doFirst(() -> log.info("first1-{}", Thread.currentThread().isVirtual()))
                        .subscribeOn(Schedulers.boundedElastic())
-                       .doFirst(() -> log.info("first2"));
+                       .doFirst(() -> log.info("first2-{}", Thread.currentThread().isVirtual()));
 
 
         Runnable runnable1 = () -> flux.subscribe(Util.subscriber("sub1"));
 
-        Thread.ofPlatform().start(runnable1);
+        Thread.ofPlatform().name("th-platform").start(runnable1);
 
         Util.sleepSeconds(2);
 
