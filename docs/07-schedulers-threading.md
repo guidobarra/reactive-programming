@@ -975,3 +975,364 @@ Flux.range(1, 10)
 | Necesitás agregar (`collectList`, `reduce`) después de `parallel()` | `sequential()` antes del agregador |
 | Solo una parte del pipeline necesita otro hilo | `publishOn()` en ese punto |
 | Todo el pipeline necesita correr en otro hilo | `subscribeOn()` una sola vez, cerca de la fuente |
+
+---
+
+## Análisis de Pipeline Complejo — Trazado de Hilos
+
+Esta sección analiza un pipeline real con múltiples schedulers, `flatMap` con inner `Flux.interval`, y `parallel` + `runOn`. Es el caso más completo para entender cómo interactúan todos los operadores de scheduling.
+
+### El código
+
+```java
+Flux
+    .interval(Duration.ofMillis(200))                                          // [1]
+    .map(s -> Util.faker().name().name())                                      // [2]
+    .subscribeOn(Schedulers.newBoundedElastic(2, 200, "th-subscribeOn"))       // [3]
+    .publishOn(Schedulers.newBoundedElastic(3, 200, "th-publishOn"))           // [4]
+    .flatMap(s -> Flux                                                         // [5]
+                    .interval(Duration.ofMillis(200))
+                    .map(t -> Util.faker().gameOfThrones().character())
+                    .take(10), 5)
+    .parallel(4)                                                               // [6]
+    .runOn(Schedulers.newBoundedElastic(4, 200, "th-runOn"))                   // [7]
+    .map(s -> processSlow(2))                                                  // [8]
+    .subscribe(s -> logs.info(s));                                             // [9]
+```
+
+### Trazado de cada hilo
+
+#### [1] `Flux.interval(200ms)` → hilo: `parallel-*` (scheduler por defecto)
+
+`Flux.interval` tiene su propio timer interno hardcodeado en `Schedulers.parallel()`. **Ignora completamente `subscribeOn`**, sin importar qué scheduler le pases. El tick ocurre en un hilo `parallel-X` siempre.
+
+```
+Schedulers.parallel() → parallel-1
+  ↓ cada 200ms emite: 0, 1, 2, 3, ...
+```
+
+#### [2] `.map(faker().name())` → hilo: `parallel-1`
+
+Sin un `publishOn` entre el intervalo y este `map`, corre en el mismo hilo que el upstream (`parallel-1`).
+
+#### [3] `.subscribeOn(th-subscribeOn)` → **sin efecto en este pipeline**
+
+⚠️ Este `subscribeOn` **no cambia el hilo de ningún elemento**. `Flux.interval` lo ignora porque usa su propio timer scheduler. Los threads `th-subscribeOn-1` y `th-subscribeOn-2` se crean pero solo se usan brevemente durante la fase de suscripción (nanosegundos). No procesan ningún elemento.
+
+```
+th-subscribeOn-1 → solo viaje de la señal subscribe() hacia la fuente
+                   luego no aparece más en el flujo de datos
+```
+
+#### [4] `.publishOn(th-publishOn)` → hilo: `th-publishOn-1` ✅
+
+Este sí tiene efecto real. Introduce una cola interna (256 elementos por defecto) y transfiere la emisión al scheduler `th-publishOn`. Desde aquí hacia abajo, los datos viajan por `th-publishOn`.
+
+```
+parallel-1 (interval emite) → [cola interna 256] → th-publishOn-1
+                                     ↑
+                            publishOn actúa como puente entre hilos
+```
+
+#### [5] `.flatMap(..., maxConcurrency=5)` → hilos: `th-publishOn-*` + `parallel-*`
+
+Este operador tiene **dos partes en distintos hilos**:
+
+**Parte A — El lambda** (crea los inner Flux): corre en `th-publishOn-1` porque viene del `publishOn`.
+
+**Parte B — Cada inner `Flux.interval(200ms)`**: cada inner interval tiene su propio timer en `Schedulers.parallel()`.
+
+```
+th-publishOn-1 → ejecuta lambda → crea inner Flux.interval #1, #2, #3, #4, #5
+
+parallel-2 → inner Flux#1: emite GoT character cada 200ms × 10 veces
+parallel-3 → inner Flux#2: idem
+parallel-4 → inner Flux#3: idem
+parallel-5 → inner Flux#4: idem
+parallel-6 → inner Flux#5: idem
+```
+
+Con `maxConcurrency=5` y ventanas de 200ms × 10 elementos = 2000ms por inner:
+
+```
+t=   0ms: outer emite → crea inner#1 [parallel-2]
+t= 200ms: outer emite → crea inner#2 [parallel-3]
+t= 400ms: outer emite → crea inner#3 [parallel-4]
+t= 600ms: outer emite → crea inner#4 [parallel-5]
+t= 800ms: outer emite → crea inner#5 [parallel-6]  ← maxConcurrency=5 alcanzado
+
+flatMap NO pide más al outer hasta que un inner complete
+t=2000ms: inner#1 completa → flatMap libera slot → pide request(1) al outer → crea inner#6
+```
+
+#### [6] `.parallel(4)` → distribución round-robin (sin cambiar hilo todavía)
+
+Recibe elementos mezclados de los 5 inner intervals (que vienen de `parallel-2` a `parallel-6`) y los distribuye en 4 rails:
+
+```
+char_A → Rail 0
+char_B → Rail 1
+char_C → Rail 2
+char_D → Rail 3
+char_E → Rail 0  (vuelve)
+...
+```
+
+#### [7] `.runOn(th-runOn)` → hilos: `th-runOn-1` a `th-runOn-4` ✅
+
+Asigna un hilo dedicado por rail. Los 4 hilos corren en paralelo:
+
+```
+Rail 0 → th-runOn-1  (siempre este hilo para este rail)
+Rail 1 → th-runOn-2
+Rail 2 → th-runOn-3
+Rail 3 → th-runOn-4
+```
+
+#### [8] `.map(processSlow(2))` → hilos: `th-runOn-1` a `th-runOn-4`
+
+`processSlow(2)` bloquea 2 segundos por elemento. Los 4 rails lo ejecutan simultáneamente:
+
+```
+th-runOn-1: processSlow(2) [2s]
+th-runOn-2: processSlow(2) [2s]  ← simultáneo
+th-runOn-3: processSlow(2) [2s]  ← simultáneo
+th-runOn-4: processSlow(2) [2s]  ← simultáneo
+```
+
+### Mapa completo de hilos
+
+```
+OPERADOR                           HILO DE EJECUCIÓN
+───────────────────────────────────────────────────────────────────
+Flux.interval(outer, 200ms)        parallel-1  (default parallel scheduler)
+.map(faker name)                   parallel-1  (mismo que interval, sin cambio)
+.subscribeOn(th-subscribeOn)       ⚠️  NO TIENE EFECTO — interval ignora subscribeOn
+.publishOn(th-publishOn)           th-publishOn-1  ← CAMBIO REAL DE HILO
+.flatMap lambda (crea inner Flux)  th-publishOn-1  (viene del publishOn)
+  inner Flux.interval #1           parallel-2  (cada inner tiene su timer propio)
+  inner Flux.interval #2           parallel-3
+  inner Flux.interval #3           parallel-4
+  inner Flux.interval #4           parallel-5
+  inner Flux.interval #5           parallel-6
+.parallel(4) distribución          (hilos de los inner Fluxes)
+.runOn(th-runOn)                   th-runOn-1, 2, 3, 4  ← CAMBIO REAL DE HILO
+.map(processSlow)                  th-runOn-1, 2, 3, 4  (4 hilos en paralelo)
+.subscribe callback                th-runOn-1, 2, 3, 4
+```
+
+### ⚠️ El problema de este pipeline: producer-consumer imbalance
+
+```
+Velocidad de producción (flatMap → parallel):
+  5 inner Fluxes × 1 elemento cada 200ms = 25 elementos/segundo
+
+Velocidad de consumo (processSlow):
+  4 rails × (1 elemento / 2000ms) = 2 elementos/segundo
+
+Ratio: produce 25/seg, consume 2/seg → ×12.5 más rápido el producer
+```
+
+Lo que ocurre:
+1. Las colas internas de los 4 rails (`runOn`) se llenan rápidamente
+2. `parallel` aplica backpressure a `flatMap`
+3. `flatMap` deja de pedir a los inner Fluxes
+4. Los inner Fluxes son **`Flux.interval`** (timer-based) → no soportan backpressure
+5. → **`MissingBackpressureException`** o descarte silencioso de elementos
+
+**Cómo corregirlo:**
+
+```java
+// Opción A: reducir flatMap maxConcurrency para limitar la producción
+.flatMap(..., 2)  // solo 2 inner Fluxes en vez de 5
+
+// Opción B: agregar estrategia de backpressure explícita antes de parallel
+.onBackpressureDrop()   // descarta si no puede procesar
+.parallel(4)
+
+// Opción C: si processSlow es I/O-bound, usar flatMap en vez de parallel
+.flatMap(s -> Mono.fromCallable(() -> processSlow(2))
+                  .subscribeOn(Schedulers.boundedElastic()), 4)
+// 4 operaciones bloqueantes simultáneas sin bloquear hilos del Event Loop
+```
+
+---
+
+## `flatMap(mapper, N)` vs `parallel(N).runOn()` — ¿Cuál usar?
+
+Ambos permiten procesar elementos de forma concurrente y ninguno bloquea el hilo principal. Sin embargo, modelan la concurrencia de formas completamente distintas.
+
+### La analogía del restaurante
+
+**`parallel(4).runOn(scheduler)`** = 4 mozos que se bloquean esperando:
+
+```
+Mozo 1 → toma pedido A → va a cocina → SE QUEDA PARADO ESPERANDO 3min → trae el plato
+Mozo 2 → toma pedido B → va a cocina → SE QUEDA PARADO ESPERANDO 3min → trae el plato
+Mozo 3 → toma pedido C → va a cocina → SE QUEDA PARADO ESPERANDO 3min → trae el plato
+Mozo 4 → toma pedido D → va a cocina → SE QUEDA PARADO ESPERANDO 3min → trae el plato
+
+Pedido E → ESPERA. Los 4 mozos están bloqueados en la cocina sin hacer nada útil.
+```
+
+**`flatMap(mapper, 10)`** = 10 mozos que nunca esperan:
+
+```
+Mozo 1 → toma pedido A → manda la orden → LIBRE → toma pedido B
+Mozo 2 → toma pedido C → manda la orden → LIBRE → toma pedido D
+...
+Cocina avisa "pedido A listo" → el mozo libre más cercano lo busca y lo lleva
+
+En el mismo tiempo: 10 pedidos en vuelo, los mozos nunca están parados.
+```
+
+### Diferencias técnicas
+
+| | `flatMap(mapper, N)` | `parallel(N).runOn(sched)` |
+|---|---|---|
+| **¿Qué son los N?** | N Publishers internos activos simultáneamente | N rails fijos, 1 hilo dedicado cada uno |
+| **Origen de los hilos** | Los que use cada inner Publisher (dinámico) | El scheduler de `runOn` (fijo) |
+| **Necesita mapper** | ✅ Sí (devuelve un Publisher) | ❌ No (solo distribuye elementos) |
+| **Hilos creados** | Depende de cada inner Publisher | Exactamente N hilos del scheduler |
+| **I/O no bloqueante** | ✅ Ideal — los hilos no esperan | ❌ Overhead sin beneficio |
+| **CPU-bound** | ⚠️ Funciona pero overhead innecesario | ✅ Ideal — hilos siempre computando |
+| **Orden garantizado** | ❌ No | ❌ No (sin `sequential()`) |
+
+### ¿Por qué `flatMap` es mejor para I/O?
+
+Con I/O, el hilo espera la respuesta (red, disco, BD) sin hacer nada útil. `flatMap` lanza la operación async y **libera el hilo** para hacer otra cosa mientras espera:
+
+```java
+// ✅ flatMap para I/O async — los hilos nunca se bloquean
+Flux.fromIterable(users)
+    .flatMap(user -> httpClient.get("/api/" + user.id()), 10)
+    // 10 llamadas HTTP en vuelo simultáneamente
+    // Mientras una espera respuesta → el hilo está libre para otra
+
+// ❌ parallel para I/O bloqueante — 4 hilos bloqueados esperando
+Flux.fromIterable(users)
+    .parallel(4)
+    .runOn(Schedulers.boundedElastic())
+    .map(user -> blockingHttpClient.get("/api/" + user.id()))
+    // 4 hilos parados esperando respuesta HTTP
+    // El 5to usuario espera aunque la red esté libre
+```
+
+### ¿Por qué `parallel` es mejor para CPU?
+
+Con CPU, el hilo está computando todo el tiempo: nunca espera algo externo. Los N hilos fijos aprovechan los N núcleos del procesador:
+
+```java
+// ✅ parallel para CPU-bound — 4 núcleos computando en paralelo
+Flux.fromIterable(images)
+    .parallel(4)
+    .runOn(Schedulers.parallel())  // 1 hilo por núcleo
+    .map(img -> resizeImage(img))  // siempre computa, nunca espera
+    .sequential()
+
+// ⚠️ flatMap para CPU — funciona pero agrega overhead innecesario
+Flux.fromIterable(images)
+    .flatMap(img -> Mono.fromCallable(() -> resizeImage(img))
+                        .subscribeOn(Schedulers.parallel()), 4)
+    // Mismo resultado pero más complejo sin beneficio
+```
+
+### Regla simple
+
+```
+¿Tu operación espera algo externo? (HTTP, BD, disco)
+    → flatMap(mapper, N)
+
+¿Tu operación computa sin parar? (cálculo, compresión, encriptación)
+    → parallel(N).runOn(Schedulers.parallel())
+```
+
+---
+
+## `newBoundedElastic(threadCap, queueCap, name)` — ¿Cuándo importa el `threadCap`?
+
+### Los parámetros
+
+```java
+Schedulers.newBoundedElastic(threadCap, queuedTaskCap, name)
+//                           ↑           ↑               ↑
+//                    máx hilos    cola por hilo       nombre
+```
+
+```java
+.subscribeOn(Schedulers.newBoundedElastic(2, 200, "th-subscribeOn"))
+//                                        ↑ máximo 2 hilos simultáneos
+
+.publishOn(Schedulers.newBoundedElastic(3, 200, "th-publishOn"))
+//                                      ↑ máximo 3 hilos simultáneos
+```
+
+### ¿Cuándo el `threadCap` **no** importa?
+
+Con **una sola suscripción**:
+- `subscribeOn` usa 1 hilo. `threadCap=2` o `threadCap=100` → igual, solo usa 1.
+- `publishOn` drena la cola con 1 hilo a la vez. Nunca necesita más con 1 subscriber.
+- El número podría ser cualquier valor ≥ 1 y el comportamiento sería idéntico.
+
+### ¿Cuándo el `threadCap` **sí** importa?
+
+#### Caso 1: múltiples suscripciones simultáneas al mismo Flux
+
+```java
+var flux = Flux.create(sink -> {
+               consultarBaseDeDatos();  // bloqueante, 3 segundos
+               sink.next(resultado);
+           })
+           .subscribeOn(Schedulers.newBoundedElastic(2, 200, "th-sub"));
+
+flux.subscribe(sub1);  // → agarra th-sub-1
+flux.subscribe(sub2);  // → agarra th-sub-2
+flux.subscribe(sub3);  // ⚠️ espera — solo hay 2 hilos disponibles
+                       //   si la cola (200) también se llena → RejectedExecutionException
+```
+
+`threadCap=2` = **máximo 2 consultas a la BD en simultáneo**. Protege el recurso de ser bombardeado.
+
+#### Caso 2: servidor HTTP con múltiples requests concurrentes
+
+```java
+// En un servidor: cada request HTTP es una suscripción distinta
+var sharedFlux = Flux.range(1, 1000)
+                     .publishOn(Schedulers.newBoundedElastic(3, 200, "th-pub"))
+                     .map(n -> procesarDato(n));
+
+sharedFlux.subscribe(request1);  // → th-pub-1
+sharedFlux.subscribe(request2);  // → th-pub-2 (simultáneo con request1)
+sharedFlux.subscribe(request3);  // → th-pub-3 (simultáneo con los otros)
+sharedFlux.subscribe(request4);  // ⚠️ espera — máximo 3 hilos
+```
+
+`threadCap=3` = **máximo 3 requests procesándose en paralelo** → control de concurrencia del servidor.
+
+### Resumen: cuándo el número importa
+
+| Escenario | `subscribeOn(N)` importa | `publishOn(N)` importa |
+|---|---|---|
+| 1 sola suscripción | ❌ N irrelevante (usa 1 hilo) | ❌ N irrelevante (usa 1 hilo) |
+| Fuente es `Flux.interval` | ❌ Ignorado siempre | ✅ N = máx subscriptions simultáneas |
+| Fuente bloqueante + N subscriptions | ✅ N = máx operaciones paralelas | ✅ N = máx subscriptions simultáneas |
+| Servidor HTTP con muchos requests | ✅ N = límite de concurrencia | ✅ N = límite de concurrencia |
+
+### `newBoundedElastic` vs `boundedElastic` global
+
+```java
+// boundedElastic() global — pool compartido por toda la aplicación
+.subscribeOn(Schedulers.boundedElastic())
+// Límite: 10 × cantidad de CPUs (configurable con reactor.schedulers.defaultBoundedElasticSize)
+// Comparte hilos con todos los demás usos de boundedElastic en la app
+
+// newBoundedElastic(N, ...) — pool privado y aislado
+.subscribeOn(Schedulers.newBoundedElastic(2, 200, "th-sub"))
+// Límite: exactamente N hilos, solo para este scheduler
+// No comparte recursos con otras partes de la app → predecible y controlado
+```
+
+**Cuándo usar `newBoundedElastic` en vez del global:**
+- Querés aislar un recurso específico (BD, API externa) y limitar su concurrencia
+- Querés dar un nombre descriptivo para identificar hilos en logs y profiling
+- El pool global ya está saturado y necesitás un pool separado con sus propias reglas
